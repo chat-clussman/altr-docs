@@ -1,0 +1,266 @@
+CREATE OR REPLACE PROCEDURE SETUP_ALTR_SERVICE_ACCOUNT(IS_PARTNER_CONNECT BOOLEAN)
+RETURNS STRING
+LANGUAGE JAVASCRIPT
+VOLATILE
+EXECUTE AS CALLER
+AS $$
+  // ********************************************
+  // Stored Procedure Caller Report
+  // ********************************************
+  function AltrServiceAccountException(message) {
+    this.message = message;
+  }
+
+  function StoredProcedureReport() {
+    this.isSuccess = true;
+    this.successMessages = [];
+    this.failMessages = [];
+
+    this.fail = function(message) {
+      this.isSuccess = false;
+      this.failMessages.push(message);
+    }
+
+    this.success = function(message) {
+      this.successMessages.push(message);
+    }
+
+    this.callerReport = function() {
+      let report = '';
+
+      function appendMessages(prefix, messages) {
+        const totalPrefix = '\n[' + prefix + ']: ';
+        for (const message of messages) {
+          report += totalPrefix + message;
+        }
+      }
+
+      if (this.isSuccess) {
+        report = 'SUCCEEDED!';
+      } else {
+        report = 'FAILED!';
+        appendMessages('FAILURE', this.failMessages);
+      }
+
+      appendMessages('SUCCESS', this.successMessages);
+
+      return report;
+    }
+  }
+
+  var RUN_AS_ALTR = false;
+  const storedProcedureReport = new StoredProcedureReport();
+
+  // ********************************************
+  // Utilities
+  // ********************************************
+
+  function isNullOrEmpty(str) {
+    return typeof('string') !== typeof(str) || str.length < 1;
+  }
+
+  // https://docs.snowflake.com/en/sql-reference/stored-procedures-api.html
+  function execQuery(queryString) {
+    return snowflake.execute({sqlText:queryString});
+  }
+
+  function execStatement(queryString, handleError) {
+    try {
+      const resultSet = execQuery(queryString);
+      storedProcedureReport.success(queryString);
+      return true;
+    } catch (error) {
+      let reportFailure = true;
+      if ('function' === typeof(handleError)) {
+        try {
+          reportFailure = handleError(queryString, error);
+        } catch (error) {
+          reportFailure = true;
+        }
+      }
+      if (reportFailure) {
+        storedProcedureReport.fail(queryString + ": " + error);
+      }
+    }
+    return false;
+  }
+
+  // https://docs.snowflake.com/en/sql-reference/identifiers-syntax.html
+  function delimitIdentifier(identifier) {
+    return '"' + identifier.replace(/\"/g, '""') + '"';
+  }
+
+  function getDelimitedComment(objectType) {
+    return "'This " + objectType + " is used by ALTR to help simplify governance and control over data in Snowflake. Please do not modify without speaking with ALTR Support.'";
+  }
+
+  // ********************************************
+  // Main functionality
+  // ********************************************
+
+  function permissionRole(delimitedRoleName) {
+    // ********************************************
+    // Grant account-level privileges on the role
+    // ********************************************
+
+    let targetRoleExists = true;
+    execStatement('GRANT CREATE DATABASE ON ACCOUNT TO ROLE ' + delimitedRoleName, function(queryString, error) {
+      const errorString = '' + error;
+      if (errorString.includes('Role ') && errorString.includes(' does not exist or not authorized.')) {
+        // Use this initial grant to check validity of the input role.
+        targetRoleExists = false;
+
+        let extraInfo = '';
+        const upperCaseTargetRoleName = ALTR_SERVICE_ROLE_NAME.toUpperCase();
+        if (ALTR_SERVICE_ROLE_NAME !== upperCaseTargetRoleName) {
+          extraInfo = '. Perhaps you meant role ' + upperCaseTargetRoleName;
+        }
+
+        storedProcedureReport.fail('You called this stored procedure with a role that does not exist: ' + ALTR_SERVICE_ROLE_NAME + extraInfo + '.');
+        if (RUN_AS_ALTR) {
+          throw new AltrServiceAccountException(storedProcedureReport.callerReport());
+        }
+        return false;
+      } else {
+        // Some other error when executing the grant. Report the
+        // error, but keep executing.
+        return true;
+      }
+    });
+
+    if (!targetRoleExists) return;
+
+    execStatement('GRANT APPLY MASKING POLICY ON ACCOUNT TO ROLE ' + delimitedRoleName, function(queryString, error) {
+      // This stored procedure is written to execute on all editions of Snowflake,
+      // including those that do not support masking policies. So, if we happen
+      // to be on the latter, swallow this error silently and move on.
+      return !('' + error).includes('Unsupported feature');
+    });
+
+    execStatement('GRANT CREATE INTEGRATION ON ACCOUNT TO ROLE ' + delimitedRoleName);
+    execStatement('GRANT APPLY TAG ON ACCOUNT TO ROLE ' + delimitedRoleName);
+    execStatement('GRANT APPLY ROW ACCESS POLICY ON ACCOUNT TO ROLE ' + delimitedRoleName);
+
+    // ********************************************
+    // Grant privileges on warehouses to role
+    // ********************************************
+
+    const warehouseNames = [];
+
+    let resultSet = execQuery('SHOW WAREHOUSES');
+    while (resultSet.next()) {
+      warehouseNames.push(resultSet.getColumnValueAsString('name'));
+    }
+
+    for (const warehouseName of warehouseNames) {
+      execStatement('GRANT MONITOR ON WAREHOUSE ' + delimitIdentifier(warehouseName) + ' TO ROLE ' + delimitedRoleName);
+    }
+
+    // ********************************************
+    // Grant database-level privileges to role
+    // ********************************************
+
+    const databaseNames = [];
+
+    resultSet = execQuery('SHOW DATABASES');
+    while (resultSet.next()) {
+      const origin = resultSet.getColumnValueAsString('origin');
+      if (isNullOrEmpty(origin)) {
+        // Databases with a non-null origin are shared or otherwise
+        // external databases and we do not want to apply governance
+        // here, so we exclude them.
+        databaseNames.push(resultSet.getColumnValueAsString('name'));
+      }
+    }
+
+    for (const databaseName of databaseNames) {
+      const delimitedDatabaseName = delimitIdentifier(databaseName);
+      execStatement('GRANT USAGE ON DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName);
+      execStatement('GRANT CREATE SCHEMA ON DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName);
+      execStatement('GRANT USAGE ON FUTURE SCHEMAS IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName);
+      execStatement('GRANT USAGE ON ALL SCHEMAS IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName);
+      execStatement('GRANT SELECT ON FUTURE TABLES IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName);
+      execStatement('GRANT SELECT ON ALL TABLES IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName);
+      execStatement('GRANT CREATE TAG ON FUTURE SCHEMAS IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName);
+      execStatement('GRANT CREATE TAG ON ALL SCHEMAS IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName);
+      execStatement('GRANT CREATE ROW ACCESS POLICY ON FUTURE SCHEMAS IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName);
+      execStatement('GRANT CREATE ROW ACCESS POLICY ON ALL SCHEMAS IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName);
+    }
+
+    execStatement('GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE TO ROLE ' + delimitedRoleName);
+  }
+
+  function permissionUser(delimitedRoleName, delimitedUserName, delimitedWarehouseName) { 
+    // Create the role for ALTR and assign the role to SYSADMIN as recommended by
+    // Snowflake to help with troubleshooting and debugging if necessary.
+    execStatement('CREATE ROLE IF NOT EXISTS ' + delimitedRoleName);
+    execStatement('ALTER ROLE ' + delimitedRoleName + ' SET COMMENT = ' + getDelimitedComment('role'));
+    execStatement('GRANT ROLE ' + delimitedRoleName + ' TO ROLE SYSADMIN');
+
+    // Create the warehouse for ALTR and grant usage of it to the ALTR role.
+    // Though XSMALL is the default for WAREHOUSE_SIZE and TRUE is the default
+    // for AUTO_RESUME, we include them anyway because if the defaults of these
+    // properties ever change, there will be serious functionality and cost concerns.
+    execStatement('CREATE WAREHOUSE IF NOT EXISTS ' + delimitedWarehouseName
+      + ' WITH WAREHOUSE_SIZE = XSMALL SCALING_POLICY = ECONOMY AUTO_SUSPEND = 60 AUTO_RESUME = TRUE INITIALLY_SUSPENDED = TRUE');
+    execStatement('ALTER WAREHOUSE ' + delimitedWarehouseName + ' SET COMMENT = ' + getDelimitedComment('warehouse'));
+    execStatement('GRANT USAGE ON WAREHOUSE ' + delimitedWarehouseName + ' TO ROLE ' + delimitedRoleName);
+
+    // Transfer ownership of the warehouse to customer SYSADMIN. They can then
+    // assign resource monitors and other customer-specific configuration.
+    // Though this procedure will necessarily run as ACCOUNTADMIN, Snowflake
+    // recommeneds that database objects be owned by SYSADMIN.
+    execStatement('GRANT OWNERSHIP ON WAREHOUSE ' + delimitedWarehouseName + ' TO ROLE SYSADMIN COPY CURRENT GRANTS');
+
+    // Permission the ALTR role. Be sure to do this after you create the
+    // ALTR warehouse so the ALTR role gets monitor on that warehouse.
+    permissionRole(delimitedRoleName);
+
+    // Finally, assign the role to the user (the latter must already be created)
+    // and set appropriate defaults.
+    execStatement('GRANT ROLE ' + delimitedRoleName + ' TO USER ' + delimitedUserName);
+    execStatement('ALTER USER ' + delimitedUserName + ' SET DEFAULT_ROLE = ' + delimitedRoleName);
+    execStatement('ALTER USER ' + delimitedUserName + ' SET DEFAULT_WAREHOUSE = ' + delimitedWarehouseName);
+    execStatement('ALTER USER ' + delimitedUserName + ' SET COMMENT = ' + getDelimitedComment('user'));
+  }
+
+  // ********************************************
+  // Main
+  // ********************************************
+
+  // This script must execute as ACCOUNTADMIN so that
+  // we can grant the target role permissions on objects
+  // that the target role may not even be able to see.
+  let paramsResultSet = execQuery("SHOW PARAMETERS LIKE '%QUERY_TAG%' IN SESSION");
+  while (paramsResultSet.next()) {
+    let queryTagStr = '';
+    queryTagStr = paramsResultSet.getColumnValueAsString('value');
+    if (!isNullOrEmpty(queryTagStr) && queryTagStr === "ALTR") {
+      RUN_AS_ALTR = true;
+    }
+  }
+  
+  try {
+    execQuery("USE ROLE ACCOUNTADMIN");
+  } catch (error) {
+    storedProcedureReport.fail('You must call this stored procedure with a user and role that can assume role ACCOUNTADMIN: ' + error);
+    if (RUN_AS_ALTR) {
+      throw new AltrServiceAccountException(storedProcedureReport.callerReport());
+    }
+    return storedProcedureReport.callerReport();
+  }
+
+  if (IS_PARTNER_CONNECT) {
+    permissionRole('"PC_ALTR_ROLE"');
+  } else {
+    permissionUser('"ALTR_SERVICE_ROLE"', '"ALTR_SERVICE_USER"', '"ALTR_SERVICE_WH"');
+  }
+
+  report = storedProcedureReport.callerReport();
+  if (storedProcedureReport.isSuccess) {
+    execStatement("ALTER PROCEDURE IF EXISTS {{.Database}}.{{.Schema}}.SETUP_ALTR_SERVICE_ACCOUNT(BOOLEAN) SET COMMENT = '" + new Date().toUTCString() + "'");
+  } else if (RUN_AS_ALTR) {
+    throw new AltrServiceAccountException(report)
+  }
+  return report;
+$$;
