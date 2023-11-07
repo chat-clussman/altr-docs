@@ -15,6 +15,8 @@ AS $$
     this.isSuccess = true;
     this.successMessages = [];
     this.failMessages = [];
+    this.unknownDBList = [];
+    this.skippedDBList = [];
 
     this.fail = function(message) {
       this.isSuccess = false;
@@ -23,6 +25,14 @@ AS $$
 
     this.success = function(message) {
       this.successMessages.push(message);
+    }
+
+    this.unknownDB = function(message) {
+      this.unknownDBList.push(message);
+    }
+
+    this.skipped = function(message) {
+      this.skippedDBList.push(message);
     }
 
     this.callerReport = function() {
@@ -43,6 +53,8 @@ AS $$
       }
 
       appendMessages('SUCCESS', this.successMessages);
+      appendMessages('SKIPPED', this.skippedDBList);
+      appendMessages('UKNOWN OBJECT FOUND', this.unknownDBList);
 
       return report;
     }
@@ -57,6 +69,14 @@ AS $$
 
   function isNullOrEmpty(str) {
     return typeof('string') !== typeof(str) || str.length < 1;
+  }
+
+  function tryGetColumnValueAsString(resultSet, columnName) {
+    try {
+      return resultSet.getColumnValueAsString(columnName);
+    } catch (err) {
+      return null;
+    }
   }
 
   // https://docs.snowflake.com/en/sql-reference/stored-procedures-api.html
@@ -92,6 +112,19 @@ AS $$
 
   function getDelimitedComment(objectType) {
     return "'This " + objectType + " is used by ALTR to help simplify governance and control over data in Snowflake. Please do not modify without speaking with ALTR Support.'";
+  }
+
+  function isUknownDB(queryString, error) {
+    const errorString = '' + error;
+    let idx = -1;
+    idx = errorString.indexOf('Database');
+    if (idx !== -1) {
+      if (errorString.includes(' does not exist or not authorized.')) {
+        storedProcedureReport.unknownDB(errorString.substring(idx));
+        return false;
+      }
+    }
+    return true;
   }
 
   // ********************************************
@@ -162,35 +195,69 @@ AS $$
 
     const databaseNames = [];
 
-    resultSet = execQuery('SHOW DATABASES');
+    resultSet = execQuery('SHOW DATABASES'); // Do not use TERSE here; we need some of the columns it trims
     while (resultSet.next()) {
-      const origin = resultSet.getColumnValueAsString('origin');
-      if (isNullOrEmpty(origin)) {
-        // Databases with a non-null origin are shared or otherwise
-        // external databases and we do not want to apply governance
-        // here, so we exclude them.
-        databaseNames.push(resultSet.getColumnValueAsString('name'));
+      const name = resultSet.getColumnValueAsString('name');
+      // Exclude TRANSIENT databases. There are no TEMPORARY databases as of this writing,
+      // but we might as well exclude them if they every implement them.
+      const options = tryGetColumnValueAsString(resultSet, 'options');
+      if (!isNullOrEmpty(options)) {
+        const optionsUpper = options.toUpperCase();
+        if (optionsUpper.includes('TRANSIENT') || optionsUpper.includes('TEMPORARY')) {
+          storedProcedureReport.skipped('Database ' + name + ' because it has options: ' + options);
+          continue;
+        }
+      }
+
+      // Exclude any non-standard databases (so, shared and native app).
+      const kind = tryGetColumnValueAsString(resultSet, 'kind');
+      if (!isNullOrEmpty(kind) && !kind.toUpperCase().includes('STANDARD')) {
+        storedProcedureReport.skipped('Database ' + name + ' because it is type: ' + kind);
+        continue;
+      }
+
+      // Older versions of Snowflake did not provide us with the "kind"
+      // column in SHOW DATABASES, so we had to check the "origin" of the
+      // database. If there is an origin, it means the database "comes from
+      // somewhere", and is, therefore, a SHARED database.
+      const origin = tryGetColumnValueAsString(resultSet, 'origin');
+      if (!isNullOrEmpty(origin)) {
+        storedProcedureReport.skipped('Database ' + name + ' because it has origin: ' + origin);
+        continue;
+      }
+
+      // Just a regular database, but exclude databases with empty or null names.
+      if (!isNullOrEmpty(name)) {
+        databaseNames.push(name);
+      } else {
+        storedProcedureReport.skipped('Database ' + name + ' because it has null or empty name');
       }
     }
 
     for (const databaseName of databaseNames) {
       const delimitedDatabaseName = delimitIdentifier(databaseName);
-      execStatement('GRANT USAGE ON DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName);
-      execStatement('GRANT CREATE SCHEMA ON DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName);
-      execStatement('GRANT USAGE ON FUTURE SCHEMAS IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName);
-      execStatement('GRANT USAGE ON ALL SCHEMAS IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName);
-      execStatement('GRANT SELECT ON FUTURE TABLES IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName);
-      execStatement('GRANT SELECT ON ALL TABLES IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName);
-      execStatement('GRANT CREATE TAG ON FUTURE SCHEMAS IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName);
-      execStatement('GRANT CREATE TAG ON ALL SCHEMAS IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName);
-      execStatement('GRANT CREATE ROW ACCESS POLICY ON FUTURE SCHEMAS IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName);
-      execStatement('GRANT CREATE ROW ACCESS POLICY ON ALL SCHEMAS IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName);
+      let querySuccess = execStatement('GRANT USAGE ON DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName, isUknownDB);
+      if (querySuccess === false)
+        continue;
+      execStatement('GRANT CREATE SCHEMA ON DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName, isUknownDB);
+      execStatement('GRANT USAGE ON FUTURE SCHEMAS IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName, isUknownDB);
+      execStatement('GRANT USAGE ON ALL SCHEMAS IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName, isUknownDB);
+      execStatement('GRANT SELECT ON FUTURE TABLES IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName, isUknownDB);
+      execStatement('GRANT SELECT ON ALL TABLES IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName, isUknownDB);
+      execStatement('GRANT SELECT ON FUTURE VIEWS IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName, isUknownDB);
+      execStatement('GRANT SELECT ON ALL VIEWS IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName, isUknownDB);
+      execStatement('GRANT SELECT ON FUTURE MATERIALIZED VIEWS IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName, isUknownDB);
+      execStatement('GRANT SELECT ON ALL MATERIALIZED VIEWS IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName, isUknownDB);
+      execStatement('GRANT CREATE TAG ON FUTURE SCHEMAS IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName, isUknownDB);
+      execStatement('GRANT CREATE TAG ON ALL SCHEMAS IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName, isUknownDB);
+      execStatement('GRANT CREATE ROW ACCESS POLICY ON FUTURE SCHEMAS IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName, isUknownDB);
+      execStatement('GRANT CREATE ROW ACCESS POLICY ON ALL SCHEMAS IN DATABASE ' + delimitedDatabaseName + ' TO ROLE ' + delimitedRoleName, isUknownDB);
     }
 
-    execStatement('GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE TO ROLE ' + delimitedRoleName);
+    execStatement('GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE TO ROLE ' + delimitedRoleName, isUknownDB);
   }
 
-  function permissionUser(delimitedRoleName, delimitedUserName, delimitedWarehouseName) { 
+  function permissionUser(delimitedRoleName, delimitedUserName, delimitedWarehouseName) {
     // Create the role for ALTR and assign the role to SYSADMIN as recommended by
     // Snowflake to help with troubleshooting and debugging if necessary.
     execStatement('CREATE ROLE IF NOT EXISTS ' + delimitedRoleName);
@@ -202,8 +269,8 @@ AS $$
     // for AUTO_RESUME, we include them anyway because if the defaults of these
     // properties ever change, there will be serious functionality and cost concerns.
     execStatement('CREATE WAREHOUSE IF NOT EXISTS ' + delimitedWarehouseName
-      + ' WITH WAREHOUSE_SIZE = XSMALL SCALING_POLICY = ECONOMY AUTO_SUSPEND = 60 AUTO_RESUME = TRUE INITIALLY_SUSPENDED = TRUE');
-    execStatement('ALTER WAREHOUSE ' + delimitedWarehouseName + ' SET COMMENT = ' + getDelimitedComment('warehouse'));
+      + ' WITH WAREHOUSE_SIZE = XSMALL SCALING_POLICY = ECONOMY AUTO_RESUME = TRUE INITIALLY_SUSPENDED = TRUE');
+    execStatement('ALTER WAREHOUSE ' + delimitedWarehouseName + ' SET AUTO_SUSPEND = 30 COMMENT = ' + getDelimitedComment('warehouse'));
     execStatement('GRANT USAGE ON WAREHOUSE ' + delimitedWarehouseName + ' TO ROLE ' + delimitedRoleName);
 
     // Transfer ownership of the warehouse to customer SYSADMIN. They can then
@@ -228,18 +295,19 @@ AS $$
   // Main
   // ********************************************
 
-  // This script must execute as ACCOUNTADMIN so that
-  // we can grant the target role permissions on objects
-  // that the target role may not even be able to see.
   let paramsResultSet = execQuery("SHOW PARAMETERS LIKE '%QUERY_TAG%' IN SESSION");
   while (paramsResultSet.next()) {
     let queryTagStr = '';
     queryTagStr = paramsResultSet.getColumnValueAsString('value');
     if (!isNullOrEmpty(queryTagStr) && queryTagStr === "ALTR") {
       RUN_AS_ALTR = true;
+      break;
     }
   }
-  
+
+  // This script must execute as ACCOUNTADMIN so that
+  // we can grant the target role permissions on objects
+  // that the target role may not even be able to see.
   try {
     execQuery("USE ROLE ACCOUNTADMIN");
   } catch (error) {
@@ -251,6 +319,7 @@ AS $$
   }
 
   if (IS_PARTNER_CONNECT) {
+    execStatement('ALTER WAREHOUSE PC_ALTR_WH SET AUTO_SUSPEND = 30');
     permissionRole('"PC_ALTR_ROLE"');
   } else {
     permissionUser('"ALTR_SERVICE_ROLE"', '"ALTR_SERVICE_USER"', '"ALTR_SERVICE_WH"');
@@ -258,7 +327,7 @@ AS $$
 
   report = storedProcedureReport.callerReport();
   if (storedProcedureReport.isSuccess) {
-    execStatement("ALTER PROCEDURE IF EXISTS {{.Database}}.{{.Schema}}.SETUP_ALTR_SERVICE_ACCOUNT(BOOLEAN) SET COMMENT = '" + new Date().toUTCString() + "'");
+    execStatement("ALTER PROCEDURE IF EXISTS SETUP_ALTR_SERVICE_ACCOUNT(BOOLEAN) SET COMMENT = '" + new Date().toUTCString() + "'");
   } else if (RUN_AS_ALTR) {
     throw new AltrServiceAccountException(report)
   }
